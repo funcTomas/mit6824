@@ -151,6 +151,11 @@ type RequestVoteArgs struct {
 	LastLogTerm int
 }
 
+func (rv RequestVoteArgs) String() string {
+	return fmt.Sprintf("from %d term %d LastLogIndex %d LastLogTerm %d",
+		rv.CandidateId, rv.Term, rv.LastLogIndex, rv.LastLogTerm)
+}
+
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
@@ -165,7 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//fmt.Printf("%d get vote request from %d for term %d\n", rf.me, args.CandidateId, args.Term)
+	// fmt.Printf("%d vote request %s\n", rf.me, args)
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -248,6 +253,9 @@ func (ae AppendEntriesArgs) String() string {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -278,21 +286,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastIndex := len(rf.log) - 1
 	// new entry only could be appended when prevLogIndex and prevLogTerm matched
 	// otherwise, return false to make leader decrement the next Index for this follower
-	if !(args.PrevLogIndex <= lastIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm) {
+	if args.PrevLogIndex <= lastIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+		rf.log = rf.log[0 : args.PrevLogIndex+1]
+		if len(args.Entries) > 0 {
+			// delete the conflict existing entries
+			rf.log = append(rf.log, args.Entries[0])
+		}
+
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		}
+		reply.Success = true
+	} else {
+		// optimization for nextIndex
+		reply.XLen = len(rf.log)
+		if args.PrevLogIndex <= lastIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			for i := args.PrevLogIndex; i > 0; i-- {
+				if rf.log[i].Term != reply.XTerm {
+					break
+				}
+				reply.XIndex = i
+			}
+		}
 		reply.Success = false
-		return
 	}
-
-	rf.log = rf.log[0 : args.PrevLogIndex+1]
-	if len(args.Entries) > 0 {
-		// delete the conflict existing entries
-		rf.log = append(rf.log, args.Entries[0])
-	}
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-	}
-	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -377,7 +395,6 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if rf.role == ROLE_LEADER {
-			//fmt.Printf("match %v next %v\n", rf.matchIndex, rf.nextIndex)
 			// leader do nothing
 			rf.mu.Unlock()
 			continue
@@ -539,12 +556,20 @@ func (rf *Raft) syncLog() {
 						rf.role = ROLE_FOLLOWER
 						rf.currentTerm = reply.Term
 					} else {
+						// re-lock after AppendEntries result return
+						// make sure the reply is matched with request
 						if rf.nextIndex[srv] == args.PrevLogIndex+1 {
 							if reply.Success {
-								if rf.nextIndex[srv]+1 <= len(rf.log) {
+								// log maybe append new entry before reply return
+								// this makes len(rf.log) longer than it when request sent
+								if rf.nextIndex[srv]+1 <= len(rf.log) && len(args.Entries) > 0 {
 									rf.nextIndex[srv]++
 								}
-								rf.matchIndex[srv] = rf.nextIndex[srv] - 1
+								if len(args.Entries) > 0 {
+									// only update when a new entry appended by follower
+									// for heartbeat request, matchIndex and nextIndex keep the same
+									rf.matchIndex[srv] = args.PrevLogIndex + 1
+								}
 								// try to find N
 								flag := false
 								if rf.commitIndex < len(rf.log)-1 {
@@ -572,8 +597,25 @@ func (rf *Raft) syncLog() {
 									}
 								}
 							} else {
-								if rf.nextIndex[srv] > 1 {
-									rf.nextIndex[srv]--
+								// optimization for nextIndex
+								if reply.XIndex > 0 && reply.XTerm > 0 {
+									// case 2, leader has XTerm
+									if rf.log[reply.XIndex].Term == reply.XTerm {
+										// if two entries in different logs have the same index and term
+										// then they should store the same command
+										for i := reply.XIndex; i < len(rf.log); i++ {
+											if rf.log[i].Term != reply.XTerm {
+												break
+											}
+											rf.nextIndex[srv] = i + 1
+										}
+									} else {
+										// case 1, leader does not have xterm
+										rf.nextIndex[srv] = reply.XIndex
+									}
+								} else {
+									// case 3, follower's log is too short
+									rf.nextIndex[srv] = reply.XLen
 								}
 							}
 						}
