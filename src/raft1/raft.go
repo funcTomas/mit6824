@@ -9,6 +9,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,10 @@ const (
 type LogEntry struct {
 	Term  int
 	Value any
+}
+
+func (le LogEntry) String() string {
+	return fmt.Sprintf("[%d]=%v", le.Term, le.Value)
 }
 
 // A Go object implementing a single Raft peer.
@@ -63,6 +68,7 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server
 	matchIndex []int
 	hbVisited  bool
+	applyCh    chan raftapi.ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -234,14 +240,20 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (ae AppendEntriesArgs) String() string {
+	return fmt.Sprintf("from %d in term %d prevLogIndex %d prevLogTerm %d entry: %s leaderCommit %d",
+		ae.LeaderId, ae.Term, ae.PrevLogIndex, ae.PrevLogTerm, ae.Entries, ae.LeaderCommit)
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//fmt.Printf("%d appendEntries from %d in term %d\n", rf.me, args.LeaderId, args.Term)
+	//fmt.Printf("%d appendEntries %s\n", rf.me, args)
 	rf.mu.Lock()
+	//	fmt.Printf("%d has log %v commit %d\n", rf.me, rf.log, rf.commitIndex)
 	defer func() {
 		rf.mu.Unlock()
 	}()
@@ -261,30 +273,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// update currentTerm
 		rf.currentTerm = args.Term
 	}
+	reply.Term = args.Term
+
+	lastIndex := len(rf.log) - 1
 	// new entry only could be appended when prevLogIndex and prevLogTerm matched
-	// otherwise, return false to let leader decrement the nextIndex for this follower
-	if args.PrevLogIndex != len(rf.log)-1 {
+	// otherwise, return false to make leader decrement the next Index for this follower
+	if !(args.PrevLogIndex <= lastIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm) {
 		reply.Success = false
-		reply.Term = args.Term
 		return
 	}
-	if args.PrevLogIndex == len(rf.log)-1 && len(args.Entries) > 0 {
-		// TODO
-		if args.PrevLogTerm != rf.log[len(rf.log)-1].Term {
-			// replace the exist log with args.Entries and delete existing entry after it
-			// maybe update rf.LastIndex
-		}
 
+	rf.log = rf.log[0 : args.PrevLogIndex+1]
+	if len(args.Entries) > 0 {
+		// delete the conflict existing entries
+		rf.log = append(rf.log, args.Entries[0])
 	}
+
 	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit > len(rf.log)-1 {
-			rf.commitIndex = len(rf.log) - 1
-		} else {
-			rf.commitIndex = args.LeaderCommit
-		}
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 	reply.Success = true
-	reply.Term = args.Term
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -310,7 +318,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != ROLE_LEADER {
+		isLeader = false
+		return index, term, isLeader
+	}
+	term = rf.currentTerm
+	rf.log = append(rf.log, LogEntry{Term: term, Value: command})
+	index = len(rf.log) - 1
 	return index, term, isLeader
 }
 
@@ -334,7 +350,23 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	go func() {
+		for !rf.killed() {
+			ms := 30
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			rf.mu.Lock()
+			if rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Value,
+					CommandIndex: rf.lastApplied,
+				}
+			}
+			rf.mu.Unlock()
+		}
+	}()
+	for !rf.killed() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
@@ -345,6 +377,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if rf.role == ROLE_LEADER {
+			//fmt.Printf("match %v next %v\n", rf.matchIndex, rf.nextIndex)
 			// leader do nothing
 			rf.mu.Unlock()
 			continue
@@ -428,15 +461,18 @@ func (rf *Raft) launchVote(term, lastLogIndex, lastLogTerm int) {
 			rf.leaderId = rf.me
 			for k := range rf.nextIndex {
 				rf.nextIndex[k] = len(rf.log)
+				rf.matchIndex[k] = 0
 			}
-			rf.matchIndex = make([]int, rf.peerCnt)
+
+			prevLog := rf.log[len(rf.log)-1]
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				Entries:      make([]LogEntry, 0),
 				LeaderId:     rf.me,
 				LeaderCommit: rf.commitIndex,
-				PrevLogIndex: 0,
-				PrevLogTerm:  0,
+				PrevLogIndex: len(rf.log) - 1,
+				PrevLogTerm:  prevLog.Term,
 			}
 			for i := range rf.peerCnt {
 				if i == rf.me {
@@ -468,10 +504,9 @@ func (rf *Raft) syncLog() {
 				continue
 			}
 			prevLogIndex := rf.nextIndex[srv] - 1
-			prevLogTerm, entries := 0, []LogEntry{}
-			if prevLogIndex < len(rf.log)-1 {
-				prevLogTerm = rf.log[prevLogIndex].Term
-				entries = append(entries, rf.log[prevLogIndex])
+			prevLogTerm, entries := rf.log[prevLogIndex].Term, []LogEntry{}
+			if prevLogIndex+1 < len(rf.log) {
+				entries = append(entries, rf.log[prevLogIndex+1])
 			}
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -503,14 +538,43 @@ func (rf *Raft) syncLog() {
 						// discover new term, change to be follower
 						rf.role = ROLE_FOLLOWER
 						rf.currentTerm = reply.Term
-					} else if rf.nextIndex[srv] == args.PrevLogIndex+1 {
-						if reply.Success {
-							if rf.nextIndex[srv]+1 <= len(rf.log) {
-								rf.nextIndex[srv]++
-							}
-						} else {
-							if rf.nextIndex[srv] > 1 {
-								rf.nextIndex[srv]--
+					} else {
+						if rf.nextIndex[srv] == args.PrevLogIndex+1 {
+							if reply.Success {
+								if rf.nextIndex[srv]+1 <= len(rf.log) {
+									rf.nextIndex[srv]++
+								}
+								rf.matchIndex[srv] = rf.nextIndex[srv] - 1
+								// try to find N
+								flag := false
+								if rf.commitIndex < len(rf.log)-1 {
+									for n := rf.matchIndex[srv]; n > rf.commitIndex; n-- {
+										if rf.log[n].Term != rf.currentTerm {
+											break
+										}
+										cnt := 1
+										for i := range rf.peerCnt {
+											if i == rf.me {
+												continue
+											}
+											if rf.matchIndex[i] >= n {
+												cnt++
+												if cnt > rf.peerCnt/2 {
+													flag = true
+													break
+												}
+											}
+										}
+										if flag {
+											rf.commitIndex = n
+											break
+										}
+									}
+								}
+							} else {
+								if rf.nextIndex[srv] > 1 {
+									rf.nextIndex[srv]--
+								}
 							}
 						}
 					}
@@ -560,6 +624,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, rf.peerCnt)
 
 	rf.hbVisited = false
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -568,4 +633,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
 }
