@@ -11,6 +11,7 @@ import (
 
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,8 @@ const (
 	ROLE_CANDIDATE
 	ROLE_FOLLOWER
 )
+
+const BATCH_SIZE = 20
 
 type LogEntry struct {
 	Term  int
@@ -302,11 +305,16 @@ type AppendEntriesReply struct {
 	XLen    int
 }
 
+func (aer *AppendEntriesReply) String() string {
+	return fmt.Sprintf("[Term %d Success %t XTerm %d XIndex %d XLen %d",
+		aer.Term, aer.Success, aer.XTerm, aer.XIndex, aer.XLen)
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// fmt.Printf("%d %d appendEntries %s\n", id, rf.me, args)
+	//	fmt.Printf("%d appendEntries %s\n", rf.me, args)
 	stateChanged := false
 	rf.mu.Lock()
-	// fmt.Printf("%d has log %v commit %d\n", rf.me, rf.log, rf.commitIndex)
+	//fmt.Printf("%d args %s log len %d commit %d\n", rf.me, args, len(rf.log), rf.commitIndex)
 	defer func() {
 		if stateChanged {
 			rf.persist()
@@ -331,19 +339,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		stateChanged = true
 	}
 	reply.Term = args.Term
-	reply.XLen = len(rf.log)
 
 	lastIndex := len(rf.log) - 1
 	// new entry only could be appended when prevLogIndex and prevLogTerm matched
 	// otherwise, return false to make leader decrement the next Index for this follower
 	if args.PrevLogIndex <= lastIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+		// delete the conflict existing entries
 		rf.log = rf.log[0 : args.PrevLogIndex+1]
 		if lastIndex > args.PrevLogIndex {
 			stateChanged = true
 		}
 		if len(args.Entries) > 0 {
-			// delete the conflict existing entries
-			rf.log = append(rf.log, args.Entries[0])
+			rf.log = append(rf.log, args.Entries...)
 			stateChanged = true
 		}
 
@@ -426,14 +433,18 @@ func (rf *Raft) ticker() {
 	go func() {
 		for !rf.killed() {
 			rf.mu.Lock()
-			if rf.lastApplied < rf.commitIndex && !rf.killed() {
-				rf.lastApplied++
-				rf.applyCh <- raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Value,
-					CommandIndex: rf.lastApplied,
+			for range BATCH_SIZE {
+				if rf.lastApplied < rf.commitIndex && !rf.killed() {
+					rf.lastApplied++
+					rf.applyCh <- raftapi.ApplyMsg{
+						CommandValid: true,
+						Command:      rf.log[rf.lastApplied].Value,
+						CommandIndex: rf.lastApplied,
+					}
+					//fmt.Printf("%d try to apply %d\n", rf.me, rf.lastApplied)
+				} else {
+					break
 				}
-				//fmt.Printf("%d try to apply %d\n", rf.me, rf.lastApplied)
 			}
 			rf.mu.Unlock()
 			ms := 30
@@ -497,12 +508,15 @@ func (rf *Raft) launchVote(term, lastLogIndex, lastLogTerm int) {
 			}
 			reply := &RequestVoteReply{}
 			if ok := rf.sendRequestVote(srv, args, reply); ok {
-				if reply.VoteGranted {
-					if atomic.AddInt32(&voteCnt, 1) > int32(rf.peerCnt/2) {
-						doneCh <- struct{}{}
+				// ignore the stale reply for previous vote request because of network delay
+				if reply.Term >= args.Term {
+					if reply.VoteGranted {
+						if atomic.AddInt32(&voteCnt, 1) > int32(rf.peerCnt/2) {
+							doneCh <- struct{}{}
+						}
+					} else if reply.Term > args.Term {
+						newTermCh <- reply.Term
 					}
-				} else if reply.Term > args.Term {
-					newTermCh <- reply.Term
 				}
 			}
 		}(i)
@@ -540,15 +554,14 @@ func (rf *Raft) launchVote(term, lastLogIndex, lastLogTerm int) {
 				rf.matchIndex[k] = 0
 			}
 
-			prevLog := rf.log[len(rf.log)-1]
-
+			lastIndex := len(rf.log) - 1
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				Entries:      make([]LogEntry, 0),
 				LeaderId:     rf.me,
 				LeaderCommit: rf.commitIndex,
-				PrevLogIndex: len(rf.log) - 1,
-				PrevLogTerm:  prevLog.Term,
+				PrevLogIndex: lastIndex,
+				PrevLogTerm:  rf.log[lastIndex].Term,
 			}
 			for i := range rf.peerCnt {
 				if i == rf.me {
@@ -582,7 +595,8 @@ func (rf *Raft) syncLog() {
 			prevLogIndex := rf.nextIndex[srv] - 1
 			prevLogTerm, entries := rf.log[prevLogIndex].Term, []LogEntry{}
 			if prevLogIndex+1 < len(rf.log) {
-				entries = append(entries, rf.log[prevLogIndex+1])
+				begin, end := prevLogIndex+1, min(prevLogIndex+1+BATCH_SIZE, len(rf.log))
+				entries = append(entries, rf.log[begin:end]...)
 			}
 			args := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -606,20 +620,22 @@ func (rf *Raft) syncLog() {
 				ok := rf.sendAppendEntries(srv, args, reply)
 				stateChanged := false
 				rf.mu.Lock()
+				//fmt.Printf("%d reply %s ok %t content %s\n", srv, args, ok, reply)
+				//fmt.Printf("%d logLen %d matchIndex %v nextIndex %v\n",
+				// rf.me, len(rf.log), rf.matchIndex, rf.nextIndex)
 				defer func() {
 					if stateChanged {
 						rf.persist()
 					}
+					//fmt.Printf("%d logLen %d commitIndex %d matchIndex %v nextIndex %v\n",
+					//	rf.me, len(rf.log), rf.commitIndex, rf.matchIndex, rf.nextIndex)
 					rf.mu.Unlock()
 				}()
 				if rf.role != ROLE_LEADER {
 					return
 				}
-				if !ok {
-					if atomic.AddInt32(&failCnt, 1) > int32(rf.peerCnt)/2 {
-						// a majority fail to reply, change to be follower
-						rf.role = ROLE_FOLLOWER
-					}
+				// network delay!!!
+				if reply.Term < rf.currentTerm {
 					return
 				}
 				if reply.Term > rf.currentTerm {
@@ -629,43 +645,56 @@ func (rf *Raft) syncLog() {
 					stateChanged = true
 					return
 				}
-				if rf.nextIndex[srv] == args.PrevLogIndex+1 {
-					if reply.Success {
-						// log maybe append new entry before reply return
-						// this makes len(rf.log) longer than it when request sent
-						if rf.nextIndex[srv]+1 <= len(rf.log) && len(args.Entries) > 0 {
-							rf.nextIndex[srv]++
-						}
-						if len(args.Entries) > 0 {
-							// for heartbeat request, matchIndex and nextIndex keep the same
-							rf.matchIndex[srv] = args.PrevLogIndex + 1
-						}
-						// try to find N to increase commitIndex
-						rf.incrCommitIndex(srv)
-					} else {
-						if reply.XIndex > 0 && reply.XTerm > 0 {
-							// case 2, leader has XTerm
-							if rf.log[reply.XIndex].Term == reply.XTerm {
-								// the same index and term, to make the same command
-								for i := reply.XIndex; i < len(rf.log); i++ {
-									if rf.log[i].Term != reply.XTerm {
-										break
-									}
-									rf.nextIndex[srv] = i + 1
-								}
-							} else {
-								// case 1, leader does not have xterm
-								rf.nextIndex[srv] = reply.XIndex
-							}
-						} else {
-							// case 3, follower's log is too short
-							rf.nextIndex[srv] = reply.XLen
-						}
+				if !ok {
+					if atomic.AddInt32(&failCnt, 1) > int32(rf.peerCnt)/2 {
+						// a majority fail to reply, change to be follower
+						rf.role = ROLE_FOLLOWER
 					}
-				} else {
-					fmt.Printf("%d unmatched nextIndex %d with prevLogIndex %d\n",
-						rf.me, rf.nextIndex[srv], args.PrevLogIndex+1)
+					return
 				}
+				if reply.Success {
+					// log maybe append new entries before reply return
+					if len(args.Entries) > 0 {
+						newMatchIndex := args.PrevLogIndex + len(args.Entries)
+						newNextIndex := args.PrevLogIndex + 1 + len(args.Entries)
+						// only updated when new value is greater
+						if newNextIndex <= len(rf.log) {
+							rf.nextIndex[srv] = max(newNextIndex, rf.nextIndex[srv])
+						}
+						rf.matchIndex[srv] = max(newMatchIndex, rf.matchIndex[srv])
+					} else {
+						// matchIndex for srv should be at least args.PrevLogIndex
+						// because success return true when rf.log[args.prevLogIndex] are the same
+						rf.matchIndex[srv] = max(rf.matchIndex[srv], args.PrevLogIndex)
+					}
+					// try to find N to increase commitIndex
+				} else {
+					newNextIndex := len(rf.log)
+					if reply.XIndex > 0 && reply.XTerm > 0 {
+						// case 2, leader has XTerm
+						if rf.log[reply.XIndex].Term == reply.XTerm {
+							// the same index and term, to make the same command
+							for i := reply.XIndex; i < len(rf.log); i++ {
+								if rf.log[i].Term != reply.XTerm {
+									break
+								}
+								newNextIndex = i + 1
+							}
+							// matchIndex at least shoud be XIndex
+							rf.matchIndex[srv] = max(reply.XIndex, rf.matchIndex[srv])
+						} else {
+							// case 1, leader does not have xterm
+							newNextIndex = reply.XIndex
+						}
+					} else {
+						// case 3, follower's log is too short
+						newNextIndex = reply.XLen
+					}
+					if newNextIndex < rf.nextIndex[srv] && newNextIndex > rf.matchIndex[srv] {
+						rf.nextIndex[srv] = newNextIndex
+					}
+				}
+				rf.incrCommitIndex()
 			}(i, argsList[i])
 		}
 		ms := 50
@@ -674,13 +703,24 @@ func (rf *Raft) syncLog() {
 }
 
 // need to get lock at first
-func (rf *Raft) incrCommitIndex(srv int) {
+func (rf *Raft) incrCommitIndex() {
 	if rf.commitIndex >= len(rf.log)-1 {
 		return
 	}
 	flag := false
-	for n := rf.matchIndex[srv]; n > rf.commitIndex; n-- {
+	// find the min of rf.matchIndex
+	minMatchIndex := math.MaxInt32
+	maxMatchIndex := 0
+	for k, v := range rf.matchIndex {
+		if k == rf.me {
+			continue
+		}
+		minMatchIndex = min(v, minMatchIndex)
+		maxMatchIndex = max(v, maxMatchIndex)
+	}
+	for n := maxMatchIndex; n >= minMatchIndex; n-- {
 		if rf.log[n].Term != rf.currentTerm {
+			// only commit logEntry in currentTerm
 			break
 		}
 		cnt := 1
@@ -697,7 +737,7 @@ func (rf *Raft) incrCommitIndex(srv int) {
 			}
 		}
 		if flag {
-			rf.commitIndex = n
+			rf.commitIndex = max(n, rf.commitIndex)
 			break
 		}
 	}
@@ -749,6 +789,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func min(x, y int) int {
 	if x < y {
+		return x
+	}
+	return y
+}
+
+func max(x, y int) int {
+	if x > y {
 		return x
 	}
 	return y
